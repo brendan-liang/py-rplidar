@@ -1,15 +1,16 @@
 """
 File:           rplidar.py
-Description:    RPLIDAR S1/S2/S3/C1 library for MicroPython.
+Description:    RPLIDAR S1/S2/S3/C1 library for CircuitPython.
                 Tested and designed for the RPLidar C1M1
 
 Author:         brendan-liang
 """
 
 # Imports
-import machine
+import serial
 import time
-import _thread
+import threading
+import numpy as np
 
 # Constants (serial protocol)
 _SERIAL_START = 0xA5
@@ -35,6 +36,43 @@ def _calculate_checksum(data_bytes:bytes):
     return checksum 
 
 # Helper classes
+
+class RPLidarPointCloud:
+    def __init__(self):
+        self.points = np.zeros(shape=(600, 2), dtype=np.float16) # List of (angle, distance) tuples
+        self.size = 0
+        self.terminated = False
+    
+    def add_point(self, angle:float, distance:float):
+        if self.size >= 600 or self.terminated:
+            raise Exception("Point cloud already full - I cbb handling this rn")
+        
+        last_angle = -1
+        if self.size > 0:
+            last_angle = self.points[self.size - 1][0]
+        
+        if angle < last_angle:
+            self.terminated = True
+            return (angle, distance)  # Return for creation of next point cloud
+        
+        self.points[self.size] = (angle, distance)
+        self.size += 1
+        return None
+    
+    def get_polar(self):
+        return self.points[:self.size]
+
+    def get_cartesian(self):
+        angles, dists = np.transpose(self.get_points(), (1, 0))
+        angles = np.radians(angles)
+        xs = np.sin(angles) * dists
+        ys = np.cos(angles) * dists
+        return np.transpose((xs, ys), (1, 0))
+    
+    def minify(self):
+        if self.terminated:
+            self.points = self.points[:self.size].copy()
+
 class RPLidarResponseError(Exception):
     pass
 
@@ -87,13 +125,12 @@ class RPLidarConfResponse:
         return f"RPLidarConfResponse(conf_type={hex(self.conf_type)}, config={self.config})"
 
 # Main Class
-class RPLidar(machine.UART):
+class RPLidar(serial.Serial):
     """
     RPLidar class for MicroPython.
     """
-    def __init__(self, id=0, baudrate=460800, tx=machine.Pin(0), rx=machine.Pin(1), timeout=100):
-        super().__init__(id, baudrate, tx=tx, rx=rx)
-        self.init(baudrate=baudrate, bits=8, parity=None, stop=1, timeout=timeout)
+    def __init__(self, port="/dev/ttyS0", baudrate=460800, timeout=100):
+        super().__init__(port=port, baudrate=baudrate, timeout=timeout/1000)
 
         self._timeout = timeout
         self._last_request = int(time.time_ns() * 1e-6)  # Convert to milliseconds
@@ -101,6 +138,10 @@ class RPLidar(machine.UART):
 
         self.scanning = False
         self.scan_thread = None
+
+        self.frequency = 0
+        self.point_cloud = RPLidarPointCloud()
+        self._new_point_cloud = RPLidarPointCloud()
 
         # Test connection
         info = self.get_info()
@@ -136,36 +177,20 @@ class RPLidar(machine.UART):
     def _single_response(self, length:int=-1) -> bytes:
         if self.scanning:
             return b''  # No response during scanning mode
-        last_byte_time = time.time_ns()
-        received_data = bytearray()
         # Read descriptor (7 bytes)
-        while len(received_data) < 7:
-            if self.any():
-                received_data += self.read(1)
-                last_byte_time = time.time_ns()
-                continue
-            if int(time.time_ns() - last_byte_time) * 1e-6 > self._timeout:
-                break
+        received_data = self.read(7)
         if len(received_data) < 7:
-            raise RPLidarResponseError(f"Timeout waiting for response descriptor. (Received {len(received_data)}/7 bytes)")
+            raise RPLidarResponseError(f"Invalid response descriptor. (Received {len(received_data)}/7 bytes)")
         
         # If length not specified, get from descriptor
         if length == -1:
             length = received_data[2]
 
-        length += 7  # Add descriptor length
-
-        # Read response, waiting for the full length or timeout
-        while len(received_data) < length:
-            if self.any():
-                received_data += self.read(1)
-                last_byte_time = time.time_ns()
-                continue
-            if int(time.time_ns() - last_byte_time) * 1e-6 > self._timeout:
-                break
+        # Read response
+        received_data += self.read(length)
         if not received_data:
             raise RPLidarResponseError(f"Timeout waiting for response. (No data received)")
-        if len(received_data) < length:
+        if len(received_data) < length + 7:
             raise RPLidarResponseError(f"Timeout waiting for full response. (Received {len(received_data)}/{length} bytes)")
         if received_data[0] != 0xA5 or received_data[1] != 0x5A:
             raise RPLidarResponseError("Invalid response header")
@@ -227,60 +252,96 @@ class RPLidar(machine.UART):
 
         return RPLidarConfResponse(conf_type, config)
     
-    def _scan_response(self, test_check):
+    zfil = lambda self, n: (10 - len(n)) * "0" + n[2:]
+    last_angle = 0
+
+    def _scan_response(self):
+        self.i += 1
         if not self.scanning:
             return b''  # No response if not scanning
         
         # Read block of 5 bytes
         received_data = bytearray()
         last_byte_time = time.time_ns()
-        while len(received_data) < 5:
-            if self.any():
-                received_data += self.read(1)
-                last_byte_time = time.time_ns()
-                continue
-            if int(time.time_ns() - last_byte_time) * 1e-6 > self._timeout:
-                break
+        received_data += self.read(5)
         if len(received_data) < 5:
             raise RPLidarResponseError(f"Timeout waiting for scan response. (Received {len(received_data)}/5 bytes)")
-        # Check start flag
+        # Check standard bits
         start_flag = received_data[0] & 0x01
         inverse_flag = received_data[0] & 0x02
+        check_bit = received_data[1] & 0x01
 
-        # Find check bit (test)
-        test_check = bytes([b & test_check[i] for i, b in enumerate(received_data)])
-        # if start_flag == inverse_flag:
-        #     raise RPLidarResponseError(f"Invalid scan response start flag.")
+        if start_flag == inverse_flag or not check_bit:
+        # Bytes must have shifted. Shift until fixed
+            while 1:
+                print(f"shift {self.i}")
+                self.i = 0
+                received_data = received_data[1:]  # Discard first byte
+                received_data += self.read(1)
+                # Standard bits
+                start_flag = received_data[0] & 0x01
+                inverse_flag = received_data[0] & 0x02
+                check_bit = received_data[1] & 0x01
+                
+                if start_flag == inverse_flag or not check_bit:
+                    # Still shifted, keep clearing
+                    continue
+                else:
+                    break
+
+        # Get quality, angle, distance
+        quality = received_data[0] >> 2
+        angle = (received_data[1] >> 1 | (received_data[2] << 7)) / 64.0
+        distance = (received_data[3] | (received_data[4] << 8)) / 4.0
+
+        self.last_angle = angle
+
+        # Add point to point cloud if not start of new frame
+        next_point = None
+        if not start_flag == 0x01:
+            next_point = self._new_point_cloud.add_point(angle, distance)
         
-        return test_check  # Strip off the descriptor
+        # Handle new frame
+        # DOES NOT rely on start_flag, since it's possible to skip. The angle check is more reliable.
+        if next_point is not None:
+            # Start of new frame
+            current_time = time.time_ns()
+            frame_time = (current_time - self.last_frame_time) / 1e6  # in milliseconds
+            self.last_frame_time = current_time
+            self.frequency = 1000 / frame_time if frame_time > 0 else 0
+
+            # Create new point cloud
+            self.point_cloud = self._new_point_cloud
+            self.point_cloud.minify()
+
+            self._new_point_cloud = RPLidarPointCloud()
+            if next_point:
+                self._new_point_cloud.add_point(*next_point)
+
+            # print(f"Frame complete: {self.point_cloud.size} points, {self.frequency:.2f} Hz")
+
     
     def _scan_loop(self, scan_flag):
         # Find response descriptor
         received_descriptor = bytearray()
         last_byte_time = time.time_ns()
-        while len(received_descriptor) < 7:
-            if self.any():
-                received_descriptor += self.read(1)
-                last_byte_time = time.time_ns()
-                continue
-            if int(time.time_ns() - last_byte_time) * 1e-6 > self._timeout:
-                break
+        received_descriptor += self.read(7)
         if len(received_descriptor) < 7:
             raise RPLidarResponseError(f"Timeout waiting for scan response descriptor. (Received {len(received_descriptor)}/7 bytes)")
         if received_descriptor != _SCAN_RESPONSE_DESCRIPTOR:
             raise RPLidarResponseError("Invalid scan response descriptor: " + " ".join([hex(b) for b in received_descriptor]))
         print("Scan response descriptor received: " + " ".join([hex(b) for b in received_descriptor]))
         # Main scan loop
-        sample = b'0xff\0xff\0xff\0xff\0xff'  # Dummy initial value
+        self.i = 0
+        self.last_frame_time = time.time_ns()
         while scan_flag():
-            sample = self._scan_response(sample)
-            print(sample)
+            self._scan_response()
         print("Exiting scan loop.")
 
     def stop_scan(self):
         self.scanning = False
-        # if self.scan_thread:
-        #     self.scan_thread.join()
+        if self.scan_thread:
+            self.scan_thread.join()
         self.scan_thread = None
         self._request(_CMD_STOP, wait_time=10)
     
@@ -290,14 +351,19 @@ class RPLidar(machine.UART):
         self._request(_CMD_SCAN)
         self.scanning = True
 
-        self.scan_thread = _thread.start_new_thread(self._scan_loop, (lambda: self.scanning,))
+        self.scan_thread = threading.Thread(target=self._scan_loop, args=(lambda: self.scanning,))
+        self.scan_thread.start()
 
 
 if __name__ == "__main__":
     # Simple example
-    lidar = RPLidar(0, 460800, timeout=1500)
+    lidar = RPLidar("/dev/ttyUSB0", 460800, 100)
 
-    print(f"\nHealth: {["OK", "Warning", "Error"][lidar.get_health().status]}\n")
+    health = lidar.get_health().status
+    print(f"\nHealth: {['OK', 'Warning', 'Error'][health]}\n")
+
+    if health != 0:
+        raise RuntimeError("Lidar health check failed")
     
     time.sleep(1)
 
@@ -308,3 +374,5 @@ if __name__ == "__main__":
     print("Stopping scan...")
     lidar.stop_scan()
     print("Scan stopped.")
+
+    # lidar.start_scan()
